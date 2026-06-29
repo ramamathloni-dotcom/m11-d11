@@ -7,7 +7,9 @@ import uuid
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from prometheus_client import Counter, Gauge, Histogram, make_asgi_app
+from starlette.middleware.base import BaseHTTPMiddleware
 
+# تعريف المقاييس
 requests_total = Counter(
     "requests_total",
     "Total HTTP requests",
@@ -31,49 +33,60 @@ request_id_var = contextvars.ContextVar("request_id", default="")
 logger = logging.getLogger("app")
 logger.setLevel(logging.INFO)
 
+# 1. RequestId Middleware
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        req_id = uuid.uuid4().hex
+        request_id_var.set(req_id)
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = req_id
+        return response
+
+# 2. Structured Logging Middleware
+class StructuredLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        start_time = time.time()
+        response = await call_next(request)
+        duration = time.time() - start_time
+        latency_ms = round(duration * 1000, 2)
+        
+        log_payload = {
+            "ts": time.time(),
+            "level": "INFO",
+            "request_id": request_id_var.get(),
+            "path": request.url.path,
+            "status": response.status_code,
+            "latency_ms": latency_ms
+        }
+        logger.info(json.dumps(log_payload))
+        return response
+
+# 3. Metrics Middleware
+class MetricsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        inflight_requests.inc()
+        start_time = time.time()
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            duration = time.time() - start_time
+            inflight_requests.dec()
+            requests_total.labels(path=request.url.path, status=str(response.status_code)).inc()
+            request_latency_seconds.labels(path=request.url.path).observe(duration)
+
+
 class EchoRequest(BaseModel):
     message: str
 
+
 app = FastAPI(title="M11 Drill — Toy FastAPI Service")
 
-@app.middleware("http")
-async def request_id_middleware(request: Request, call_next):
-    request_id = uuid.uuid4().hex
-    request_id_var.set(request_id)
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    return response
-
-@app.middleware("http")
-async def structured_logging_middleware(request: Request, call_next):
-    start_time = time.time()
-    response = await call_next(request)
-    duration = time.time() - start_time
-    latency_ms = round(duration * 1000, 2)
-    
-    log_payload = {
-        "ts": time.time(),
-        "level": "INFO",
-        "request_id": request_id_var.get(),
-        "path": request.url.path,
-        "status": response.status_code,
-        "latency_ms": latency_ms
-    }
-    logger.info(json.dumps(log_payload))
-    return response
-
-@app.middleware("http")
-async def metrics_middleware(request: Request, call_next):
-    inflight_requests.inc()
-    start_time = time.time()
-    try:
-        response = await call_next(request)
-        return response
-    finally:
-        duration = time.time() - start_time
-        inflight_requests.dec()
-        requests_total.labels(path=request.url.path, status=str(response.status_code)).inc()
-        request_latency_seconds.labels(path=request.url.path).observe(duration)
+# ترتيب إضافة الميدليرات: innermost-last (Metrics -> Logging -> RequestId)
+# لتوضيح أكثر: الطلب يمر بـ RequestId ثم Logging ثم Metrics
+app.add_middleware(MetricsMiddleware)
+app.add_middleware(StructuredLoggingMiddleware)
+app.add_middleware(RequestIdMiddleware)
 
 @app.post("/echo")
 def echo(req: EchoRequest):
