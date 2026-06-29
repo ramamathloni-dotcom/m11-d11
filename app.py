@@ -9,7 +9,6 @@ from pydantic import BaseModel
 from prometheus_client import Counter, Gauge, Histogram, make_asgi_app
 from starlette.middleware.base import BaseHTTPMiddleware
 
-# تعريف المقاييس
 requests_total = Counter(
     "requests_total",
     "Total HTTP requests",
@@ -33,7 +32,6 @@ request_id_var = contextvars.ContextVar("request_id", default="")
 logger = logging.getLogger("app")
 logger.setLevel(logging.INFO)
 
-# 1. RequestId Middleware
 class RequestIdMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         req_id = uuid.uuid4().hex
@@ -42,7 +40,6 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         response.headers["X-Request-ID"] = req_id
         return response
 
-# 2. Structured Logging Middleware
 class StructuredLoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         start_time = time.time()
@@ -61,29 +58,31 @@ class StructuredLoggingMiddleware(BaseHTTPMiddleware):
         logger.info(json.dumps(log_payload))
         return response
 
-# 3. Metrics Middleware
 class MetricsMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        inflight_requests.inc()
+        is_metrics = request.url.path in ["/metrics", "/metrics/"]
+        
+        if not is_metrics:
+            inflight_requests.inc()
+            
         start_time = time.time()
+        response = None
         try:
             response = await call_next(request)
             return response
         finally:
             duration = time.time() - start_time
-            inflight_requests.dec()
-            requests_total.labels(path=request.url.path, status=str(response.status_code)).inc()
-            request_latency_seconds.labels(path=request.url.path).observe(duration)
-
+            if not is_metrics:
+                inflight_requests.dec()
+                if response is not None:
+                    requests_total.labels(path=request.url.path, status=str(response.status_code)).inc()
+                    request_latency_seconds.labels(path=request.url.path).observe(duration)
 
 class EchoRequest(BaseModel):
     message: str
 
-
 app = FastAPI(title="M11 Drill — Toy FastAPI Service")
 
-# ترتيب إضافة الميدليرات: innermost-last (Metrics -> Logging -> RequestId)
-# لتوضيح أكثر: الطلب يمر بـ RequestId ثم Logging ثم Metrics
 app.add_middleware(MetricsMiddleware)
 app.add_middleware(StructuredLoggingMiddleware)
 app.add_middleware(RequestIdMiddleware)
